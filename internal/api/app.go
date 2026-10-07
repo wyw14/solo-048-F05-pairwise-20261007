@@ -20,6 +20,10 @@ import (
 	"heatpulse/internal/valve"
 )
 
+// isolationHoldTTL bounds how long an isolated section may rely on a valve
+// position without a fresh field confirmation.
+const isolationHoldTTL = 30 * time.Second
+
 type App struct {
 	DataDirectory        string
 	Events               *store.EventLog
@@ -36,6 +40,7 @@ type App struct {
 	Pressure             *pump.PressureMonitor
 	Valves               *valve.Service
 	ValveOperations      *valve.Operations
+	ValveRegistry        *valve.Registry
 	Relief               *valve.ReliefService
 	Boundaries           *valve.BoundaryService
 	Primary              *valve.PrimaryService
@@ -104,9 +109,11 @@ func NewApp(dataDirectory string) (*App, error) {
 	circulation := exchanger.NewCirculationRunner(pumpRunner)
 	antifreeze := protection.NewAntifreeze(circulation)
 	warmup := exchanger.NewWarmupService(stations)
-	relief := valve.NewReliefService(2 * time.Millisecond)
-	boundaries := valve.NewBoundaryService()
-	isolationService := isolation.NewService(topology, networkState, relief, boundaries, recorder)
+	reliefDelay := 2 * time.Millisecond
+	valveRegistry := valve.NewRegistry(dataDirectory, isolationHoldTTL)
+	relief := valve.NewReliefService(valveRegistry, reliefDelay)
+	boundaries := valve.NewBoundaryService(valveRegistry)
+	isolationService := isolation.NewService(dataDirectory, topology, networkState, valveRegistry, relief, boundaries, recorder, isolationHoldTTL)
 	targets := station.NewTargetService(stations)
 	planner := dispatch.NewPlanner(targets)
 	dispatchBuffer := dispatch.NewBuffer()
@@ -116,7 +123,7 @@ func NewApp(dataDirectory string) (*App, error) {
 		Network: networkState, Topology: topology, NetworkRegistry: networkRegistry, Stations: stations,
 		Snapshots: snapshots, Interlock: interlock, Pumps: pump.NewService(interlock, recorder),
 		PumpRunner: pumpRunner, Pressure: pressure, Valves: valve.NewService(interlock, recorder),
-		ValveOperations: valveOperations, Relief: relief, Boundaries: boundaries, Primary: primary,
+		ValveOperations: valveOperations, ValveRegistry: valveRegistry, Relief: relief, Boundaries: boundaries, Primary: primary,
 		Telemetry: telemetry.NewSeries(128), FlowReceipts: flowReceipts,
 		Balancer: hydraulic.NewBalancer(0.28), LeakDetector: hydraulic.NewLeakDetector(),
 		Protection: protection.NewService(), Latches: protection.NewLatchStore(snapshots),
@@ -134,6 +141,12 @@ func NewApp(dataDirectory string) (*App, error) {
 	if err := app.seed(); err != nil {
 		return nil, err
 	}
+	// After a restart, unconfirmed valve positions are failed and previously
+	// completed sessions become indeterminate — never silently "safe".
+	if err := isolationService.Recover(); err != nil {
+		return nil, err
+	}
+	isolationService.StartSweeper()
 	return app, nil
 }
 
@@ -157,6 +170,7 @@ func (a *App) seed() error {
 func (a *App) Close(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
+		a.Isolation.StopSweeper()
 		a.Antifreeze.Close()
 		close(done)
 	}()

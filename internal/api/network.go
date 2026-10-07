@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -62,17 +63,62 @@ func (a *App) isolateSection(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, session)
 }
 
+func (a *App) listIsolationSessions(w http.ResponseWriter, r *http.Request) {
+	sessions := a.Isolation.List()
+	if sectionID := r.URL.Query().Get("section_id"); sectionID != "" {
+		sessions = a.Isolation.ForSection(sectionID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
+func (a *App) getIsolationSession(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "sessionID")
+	session, ok := a.Isolation.Get(sessionID)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("isolation session %s not found", sessionID))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session":    session,
+		"lifecycles": a.ValveRegistry.History(sessionID, 0),
+	})
+}
+
+func (a *App) restoreIsolationSession(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Actor string `json:"actor"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	session, err := a.Isolation.Restore(r.Context(), chi.URLParam(r, "sessionID"), input.Actor)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, session)
+}
+
 func (a *App) overview(w http.ResponseWriter, _ *http.Request) {
 	auditSummary, _ := a.AuditQuery.Summary(time.Now().Add(-24 * time.Hour))
 	eventCount, _ := a.Events.Count()
 	interlocks := make(map[string]any)
 	pumpCommands := make(map[string]any)
 	sections := make(map[string]any)
+	valvePositions := make(map[string]any)
 	for _, zone := range a.Network.List() {
 		candidate, _ := a.Interlock.Snapshot(zone.ID)
 		interlocks[zone.ID] = candidate
 		pumpCommands[zone.ID] = a.Pumps.CommandsForZone(zone.ID)
-		sections[zone.ID] = a.Topology.SectionsForZone(zone.ID)
+		zoneSections := a.Topology.SectionsForZone(zone.ID)
+		sections[zone.ID] = zoneSections
+		for _, section := range zoneSections {
+			valvePositions[section.ReliefValve] = a.Relief.View(section.ReliefValve)
+			for _, boundaryID := range section.BoundaryValves {
+				valvePositions[boundaryID] = a.Boundaries.View(boundaryID)
+			}
+		}
 	}
 	stationDetails := make(map[string]any)
 	for _, item := range a.Stations.List() {
@@ -92,11 +138,7 @@ func (a *App) overview(w http.ResponseWriter, _ *http.Request) {
 		"event_count": eventCount, "hydraulic_threshold": a.Balancer.Threshold(),
 		"interlocks": interlocks, "pump_commands": pumpCommands, "sections": sections,
 		"station_details": stationDetails, "hydraulic_incidents": a.LeakDetector.Incidents(),
-		"east_relief_open": a.Relief.IsOpen("east-rv"),
-		"east_boundaries_closed": map[string]bool{
-			"east-bv-a": a.Boundaries.IsClosed("east-bv-a"),
-			"east-bv-b": a.Boundaries.IsClosed("east-bv-b"),
-		},
+		"valve_positions":          valvePositions,
 		"target_primary_admission": map[string]any{"open": primaryOpen, "proof": primaryAdmission},
 	})
 }

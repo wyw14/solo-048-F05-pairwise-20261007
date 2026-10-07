@@ -8,14 +8,18 @@ import (
 	"heatpulse/internal/hydraulic"
 )
 
+// Coordinator serializes leak-driven isolation per section. Active state is
+// derived from the durable session store where possible, so a restart does not
+// allow a second isolation session to be opened on a section whose prior
+// session is still live or indeterminate.
 type Coordinator struct {
-	service *Service
-	mu      sync.Mutex
-	active  map[string]string
+	service  *Service
+	mu       sync.Mutex
+	starting map[string]bool
 }
 
 func NewCoordinator(service *Service) *Coordinator {
-	return &Coordinator{service: service, active: make(map[string]string)}
+	return &Coordinator{service: service, starting: make(map[string]bool)}
 }
 
 func (c *Coordinator) FromIncident(ctx context.Context, incident hydraulic.LeakIncident, sectionID string) (Session, error) {
@@ -23,32 +27,23 @@ func (c *Coordinator) FromIncident(ctx context.Context, incident hydraulic.LeakI
 		return Session{}, fmt.Errorf("leak incident %s is not confirmed", incident.ID)
 	}
 	c.mu.Lock()
-	if sessionID := c.active[sectionID]; sessionID != "" {
+	if c.starting[sectionID] {
 		c.mu.Unlock()
-		if session, ok := c.service.Get(sessionID); ok {
-			return session, fmt.Errorf("section %s already has an isolation session", sectionID)
-		}
-	} else {
-		c.active[sectionID] = "starting"
+		return Session{}, fmt.Errorf("section %s isolation is already starting", sectionID)
 	}
+	if session, ok := c.service.ActiveForSection(sectionID); ok {
+		c.mu.Unlock()
+		return session, fmt.Errorf("section %s already has isolation session %s in state %s", sectionID, session.ID, session.Status)
+	}
+	c.starting[sectionID] = true
 	c.mu.Unlock()
 	session, err := c.service.Isolate(ctx, sectionID, "leak-protection")
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err != nil {
-		delete(c.active, sectionID)
-		return session, err
-	}
-	c.active[sectionID] = session.ID
-	return session, nil
+	delete(c.starting, sectionID)
+	c.mu.Unlock()
+	return session, err
 }
 
 func (c *Coordinator) Active(sectionID string) (Session, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	sessionID := c.active[sectionID]
-	if sessionID == "" || sessionID == "starting" {
-		return Session{}, false
-	}
-	return c.service.Get(sessionID)
+	return c.service.ActiveForSection(sectionID)
 }
