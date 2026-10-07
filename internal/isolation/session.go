@@ -18,20 +18,22 @@ type Status string
 const (
 	StatusOpeningRelief   Status = "opening_relief"
 	StatusClosingBoundary Status = "closing_boundaries"
+	StatusVerifyingRelief Status = "verifying_relief"
 	StatusCompleted       Status = "completed"
 	StatusFailed          Status = "failed"
 )
 
 type Session struct {
-	ID          string                `json:"id"`
-	SectionID   string                `json:"section_id"`
-	ZoneID      string                `json:"zone_id"`
-	Status      Status                `json:"status"`
-	Relief      valve.ReliefProof     `json:"relief"`
-	Boundaries  []valve.BoundaryProof `json:"boundaries"`
-	Error       string                `json:"error,omitempty"`
-	StartedAt   time.Time             `json:"started_at"`
-	CompletedAt time.Time             `json:"completed_at,omitempty"`
+	ID          string                 `json:"id"`
+	SectionID   string                 `json:"section_id"`
+	ZoneID      string                 `json:"zone_id"`
+	Status      Status                 `json:"status"`
+	Relief      valve.LifecycleProof   `json:"relief"`
+	Boundaries  []valve.LifecycleProof `json:"boundaries"`
+	Operations  map[string]string      `json:"operations"`
+	Error       string                 `json:"error,omitempty"`
+	StartedAt   time.Time              `json:"started_at"`
+	CompletedAt time.Time              `json:"completed_at,omitempty"`
 }
 
 type Service struct {
@@ -39,13 +41,14 @@ type Service struct {
 	state      *network.State
 	relief     *valve.ReliefService
 	boundaries *valve.BoundaryService
+	journal    *valve.LifecycleJournal
 	audit      *audit.Recorder
 	mu         sync.RWMutex
 	sessions   map[string]Session
 }
 
-func NewService(topology *network.Topology, state *network.State, relief *valve.ReliefService, boundaries *valve.BoundaryService, recorder *audit.Recorder) *Service {
-	return &Service{topology: topology, state: state, relief: relief, boundaries: boundaries, audit: recorder, sessions: make(map[string]Session)}
+func NewService(topology *network.Topology, state *network.State, relief *valve.ReliefService, boundaries *valve.BoundaryService, journal *valve.LifecycleJournal, recorder *audit.Recorder) *Service {
+	return &Service{topology: topology, state: state, relief: relief, boundaries: boundaries, journal: journal, audit: recorder, sessions: make(map[string]Session)}
 }
 
 func (s *Service) Isolate(ctx context.Context, sectionID, actor string) (Session, error) {
@@ -55,7 +58,9 @@ func (s *Service) Isolate(ctx context.Context, sectionID, actor string) (Session
 	}
 	session := Session{
 		ID: uuid.NewString(), SectionID: sectionID, ZoneID: section.ZoneID,
-		Status: StatusOpeningRelief, StartedAt: time.Now().UTC(), Boundaries: make([]valve.BoundaryProof, 0, len(section.BoundaryValves)),
+		Status: StatusOpeningRelief, StartedAt: time.Now().UTC(),
+		Boundaries: make([]valve.LifecycleProof, 0, len(section.BoundaryValves)),
+		Operations: make(map[string]string),
 	}
 	s.save(session)
 	if _, err := s.state.Update(section.ZoneID, func(zone *network.Zone) error {
@@ -64,20 +69,45 @@ func (s *Service) Isolate(ctx context.Context, sectionID, actor string) (Session
 	}); err != nil {
 		return s.fail(session, err)
 	}
-	proof, err := s.relief.Open(ctx, section.ReliefValve, session.ID)
+	// 泄压阀生命周期：申请 → 打开 → 保持
+	reliefOp, err := s.relief.Request(session.ID, section.ReliefValve)
 	if err != nil {
 		return s.fail(session, err)
 	}
-	session.Relief = proof
+	session.Operations[section.ReliefValve] = reliefOp.OperationID
+	if session.Relief, err = s.relief.Open(ctx, reliefOp.OperationID); err != nil {
+		return s.fail(session, err)
+	}
+	if session.Relief, err = s.relief.Hold(reliefOp.OperationID); err != nil {
+		return s.fail(session, err)
+	}
 	session.Status = StatusClosingBoundary
 	s.save(session)
+	// 边界阀生命周期：申请 → 关闭到位 → 保持 → 关闭验证
 	for _, valveID := range section.BoundaryValves {
-		boundary, err := s.boundaries.Close(ctx, valveID, session.ID, proof)
+		op, err := s.boundaries.Request(session.ID, valveID)
 		if err != nil {
 			return s.fail(session, err)
 		}
-		session.Boundaries = append(session.Boundaries, boundary)
+		session.Operations[valveID] = op.OperationID
+		if _, err := s.boundaries.Close(ctx, op.OperationID, session.Relief); err != nil {
+			return s.fail(session, err)
+		}
+		if _, err := s.boundaries.Hold(op.OperationID); err != nil {
+			return s.fail(session, err)
+		}
+		verified, err := s.boundaries.VerifyClosed(ctx, op.OperationID)
+		if err != nil {
+			return s.fail(session, err)
+		}
+		session.Boundaries = append(session.Boundaries, verified)
 		s.save(session)
+	}
+	// 边界全部验证关闭后，关闭泄压阀并做关闭验证
+	session.Status = StatusVerifyingRelief
+	s.save(session)
+	if session.Relief, err = s.relief.VerifyClosed(ctx, reliefOp.OperationID); err != nil {
+		return s.fail(session, err)
 	}
 	if _, err := s.state.Update(section.ZoneID, func(zone *network.Zone) error {
 		zone.Phase = network.PhaseIsolated
@@ -95,12 +125,21 @@ func (s *Service) Isolate(ctx context.Context, sectionID, actor string) (Session
 }
 
 func (s *Service) fail(session Session, cause error) (Session, error) {
+	// 失败路径：同一会话内所有未到终态的阀操作都记录失败，阀位视为未确认
+	_ = s.relief.FailSession(session.ID, cause.Error())
+	_ = s.boundaries.FailSession(session.ID, cause.Error())
 	session.Status = StatusFailed
 	session.Error = cause.Error()
 	session.CompletedAt = time.Now().UTC()
 	s.save(session)
 	_ = s.audit.Rejected("isolation.failed", session.SectionID, "system", cause.Error(), map[string]any{"session_id": session.ID})
 	return session, fmt.Errorf("isolation %s: %w", session.ID, cause)
+}
+
+// Proofs returns every valve lifecycle proof recorded under one isolation
+// session, so the whole operation chain can be correlated and audited.
+func (s *Service) Proofs(sessionID string) ([]valve.LifecycleProof, error) {
+	return s.journal.ForSession(sessionID)
 }
 
 func (s *Service) save(session Session) {
@@ -113,7 +152,7 @@ func (s *Service) Get(sessionID string) (Session, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	session, ok := s.sessions[sessionID]
-	session.Boundaries = append([]valve.BoundaryProof(nil), session.Boundaries...)
+	session.Boundaries = append([]valve.LifecycleProof(nil), session.Boundaries...)
 	return session, ok
 }
 
@@ -122,7 +161,7 @@ func (s *Service) List() []Session {
 	defer s.mu.RUnlock()
 	result := make([]Session, 0, len(s.sessions))
 	for _, session := range s.sessions {
-		session.Boundaries = append([]valve.BoundaryProof(nil), session.Boundaries...)
+		session.Boundaries = append([]valve.LifecycleProof(nil), session.Boundaries...)
 		result = append(result, session)
 	}
 	return result

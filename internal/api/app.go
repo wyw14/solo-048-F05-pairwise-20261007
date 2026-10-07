@@ -104,9 +104,16 @@ func NewApp(dataDirectory string) (*App, error) {
 	circulation := exchanger.NewCirculationRunner(pumpRunner)
 	antifreeze := protection.NewAntifreeze(circulation)
 	warmup := exchanger.NewWarmupService(stations)
-	relief := valve.NewReliefService(2 * time.Millisecond)
-	boundaries := valve.NewBoundaryService()
-	isolationService := isolation.NewService(topology, networkState, relief, boundaries, recorder)
+	lifecycleJournal := valve.NewLifecycleJournal(filepath.Join(dataDirectory, "valve_lifecycle.json"))
+	relief, err := valve.NewReliefService(lifecycleJournal, 2*time.Millisecond, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	boundaries, err := valve.NewBoundaryService(lifecycleJournal, 2*time.Millisecond, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	isolationService := isolation.NewService(topology, networkState, relief, boundaries, lifecycleJournal, recorder)
 	targets := station.NewTargetService(stations)
 	planner := dispatch.NewPlanner(targets)
 	dispatchBuffer := dispatch.NewBuffer()

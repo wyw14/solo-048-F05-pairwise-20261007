@@ -62,6 +62,15 @@ func (a *App) isolateSection(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, session)
 }
 
+func (a *App) isolationProofs(w http.ResponseWriter, r *http.Request) {
+	proofs, err := a.Isolation.Proofs(chi.URLParam(r, "sessionID"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, proofs)
+}
+
 func (a *App) overview(w http.ResponseWriter, _ *http.Request) {
 	auditSummary, _ := a.AuditQuery.Summary(time.Now().Add(-24 * time.Hour))
 	eventCount, _ := a.Events.Count()
@@ -96,6 +105,10 @@ func (a *App) overview(w http.ResponseWriter, _ *http.Request) {
 		"east_boundaries_closed": map[string]bool{
 			"east-bv-a": a.Boundaries.IsClosed("east-bv-a"),
 			"east-bv-b": a.Boundaries.IsClosed("east-bv-b"),
+		},
+		"east_boundaries_verified": map[string]bool{
+			"east-bv-a": a.Boundaries.VerifiedClosed("east-bv-a"),
+			"east-bv-b": a.Boundaries.VerifiedClosed("east-bv-b"),
 		},
 		"target_primary_admission": map[string]any{"open": primaryOpen, "proof": primaryAdmission},
 	})
